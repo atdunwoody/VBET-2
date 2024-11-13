@@ -14,7 +14,8 @@ import json
 import os.path
 from tqdm import tqdm
 from datetime import datetime
-
+import warnings
+warnings.filterwarnings("ignore")
 
 class VBET:
     """
@@ -45,6 +46,7 @@ class VBET:
 
         self.version = '2.1.2'
 
+        print(f"Parameters: {kwargs}")
         if not os.path.isdir(os.path.dirname(self.out)):
             os.mkdir(os.path.dirname(self.out))
 
@@ -447,74 +449,118 @@ class VBET:
 
         print('Generating valley bottom for each network segment')
         for i in tqdm(self.network.index):
+            #print(f"Processing segment {i} of {len(self.network.index)}")
+            
             seg = self.network.loc[i]
             da = seg['Drain_Area']
             seg_geom = seg.geometry
+            
+            #print(f"Drain area: {da}, Geometry type: {seg_geom.geom_type}")
 
+            # Determine buffer size based on Drain_Area (da)
             if da >= self.lg_da:
                 buf = seg_geom.buffer(self.lg_buf, cap_style=1)
+                #print("Using large buffer")
             elif self.lg_da > da >= self.med_da:
                 buf = seg_geom.buffer(self.med_buf, cap_style=1)
+                #print("Using medium buffer")
             else:
                 buf = seg_geom.buffer(self.sm_buf, cap_style=1)
+                #print("Using small buffer")
 
             bufds = gpd.GeoSeries(buf)
             coords = self.getFeatures(bufds)
 
-            with rasterio.open(self.dem) as src:
-                out_image, out_transform = rasterio.mask.mask(src, coords, crop=True)
-                out_meta = src.meta.copy()
+            # Try reading and masking the DEM
+            try:
+                with rasterio.open(self.dem) as src:
+                    #print("Opened DEM successfully")
+                    out_image, out_transform = rasterio.mask.mask(src, coords, crop=True)
+                    out_meta = src.meta.copy()
+            except Exception as e:
+                #print(f"Error reading or masking DEM: {e}")
+                break  # Optionally stop the loop here if needed
 
+            # Update metadata and write a subset of the DEM
             out_meta.update({'driver': 'Gtiff',
-                             'height': out_image.shape[1],
-                             'width': out_image.shape[2],
-                             'transform': out_transform})
-            with rasterio.open(self.scratch + '/dem_sub.tif', 'w', **out_meta) as dest:
-                dest.write(out_image)
+                            'height': out_image.shape[1],
+                            'width': out_image.shape[2],
+                            'transform': out_transform})
+
+            try:
+                with rasterio.open(self.scratch + '/dem_sub.tif', 'w', **out_meta) as dest:
+                    dest.write(out_image)
+                    #print(f"DEM subset written to {self.scratch + '/dem_sub.tif'}")
+            except Exception as e:
+                print(f"Error writing DEM subset: {e}")
+                break  # Optionally stop the loop here if needed
 
             dem = self.scratch + "/dem_sub.tif"
-            demsrc = rasterio.open(dem)
-            demarray = demsrc.read()[0, :, :]
-            ndval = demsrc.nodata
+            try:
+                demsrc = rasterio.open(dem)
+                demarray = demsrc.read()[0, :, :]
+                ndval = demsrc.nodata
+                #print("DEM subset opened and read successfully")
+            except Exception as e:
+                print(f"Error opening DEM subset: {e}")
+                break  # Optionally stop the loop here if needed
 
+            # Calculate slope
             slope = self.slope(dem)
+            #print("Slope calculated")
 
+            # Reclassify slope based on Drain_Area (da)
             if da >= self.lg_da:
                 slope_sub = self.reclassify(slope, ndval, self.lg_slope)
+                #print("Reclassified slope for large area")
             elif self.lg_da > da >= self.med_da:
                 slope_sub = self.reclassify(slope, ndval, self.med_slope)
+                #print("Reclassified slope for medium area")
             else:
                 slope_sub = self.reclassify(slope, ndval, self.sm_slope)
+                #print("Reclassified slope for small area")
 
-            # set thresholds for hole filling
+            # Set threshold for hole filling
             avlen = int(self.seglengths / len(self.network))
             if da < self.med_da:
                 thresh = avlen * self.sm_buf * 0.005
+                #print(f"Threshold set for small area: {thresh}")
             elif self.med_da <= da < self.lg_da:
                 thresh = avlen * self.med_buf * 0.005
+                #print(f"Threshold set for medium area: {thresh}")
             else:  # da >= self.lg_da:
                 thresh = avlen * self.lg_buf * 0.005
+                #print(f"Threshold set for large area: {thresh}")
 
-            # detrend segment dem
-            detr = self.detrend(dem, seg_geom)  # might want to change this offset
+            # Detrend DEM
+            detr = self.detrend(dem, seg_geom)
+            #print("DEM detrended")
 
+            # Reclassify detrended DEM
             if da >= self.lg_da:
                 depth = self.reclassify(detr, ndval, self.lg_depth)
+                #print("Reclassified depth for large area")
             elif self.lg_da > da >= self.med_da:
                 depth = self.reclassify(detr, ndval, self.med_depth)
+                #print("Reclassified depth for medium area")
             else:
                 depth = self.reclassify(detr, ndval, self.sm_depth)
+                #print("Reclassified depth for small area")
 
+            # Check overlap and fill raster holes
             overlap = self.raster_overlap(slope_sub, depth, ndval)
             if 1 in overlap:
+                #print("Overlap found, filling raster holes")
                 filled = self.fill_raster_holes(overlap, thresh, ndval)
                 a = self.raster_to_shp(filled, dem)
                 self.network.loc[i, 'fp_area'] = a
+                #print(f"Filled raster area for segment {i}")
             else:
                 self.network.loc[i, 'fp_area'] = 0
+                #print(f"No overlap for segment {i}, fp_area set to 0")
 
             demsrc.close()
-
+        #print(f"Completed processing for segment {i}\n")
         self.network.to_file(self.streams)
 
         # merge all polygons in folder and dissolve
@@ -575,8 +621,9 @@ class VBET:
             areas.append(vbf.loc[i].geometry.area/1000000.)
         vbf['Area_km2'] = areas
 
-        vbf.to_file(self.out)
+        vbf.to_file(self.out, driver='GPKG')
 
+        print(f"Saved valley bottom to {self.out}")
         # close metadata text tile
         self.md.writelines('\nFinished: {} \n'.format(datetime.now().strftime("%d/%m/%Y %H:%M:%S")))
         self.md.close()
